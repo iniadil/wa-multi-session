@@ -197,12 +197,13 @@ export class Whatsapp {
             if (connection == "connecting") {
               this.callback.get(CALLBACK_KEY.ON_CONNECTING)?.(sessionId);
               options.onConnecting?.();
-              this.sessions.get(sessionId)!.status = "connecting";
+              const session = this.sessions.get(sessionId);
+              if (session) this.sessions.get(sessionId).status = "connecting";
             }
             if (connection === "close") {
               const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
               let retryAttempt = this.retryCount.get(sessionId) ?? 0;
-              let shouldRetry;
+              let shouldRetry = false;
               if (code != DisconnectReason.loggedOut && retryAttempt < 10) {
                 shouldRetry = true;
               }
@@ -211,7 +212,9 @@ export class Whatsapp {
                 this.retryCount.set(sessionId, retryAttempt);
                 startSocket();
               } else {
-                this.sessions.get(sessionId)!.status = "disconnected";
+                const session = this.sessions.get(sessionId);
+                if (session)
+                  this.sessions.get(sessionId).status = "disconnected";
                 this.retryCount.delete(sessionId);
                 this.deleteSession(sessionId);
                 this.callback.get(CALLBACK_KEY.ON_DISCONNECTED)?.(sessionId);
@@ -221,7 +224,8 @@ export class Whatsapp {
             if (connection == "open") {
               this.retryCount.delete(sessionId);
               this.callback.get(CALLBACK_KEY.ON_CONNECTED)?.(sessionId);
-              this.sessions.get(sessionId)!.status = "connected";
+              const session = this.sessions.get(sessionId);
+              if (session) this.sessions.get(sessionId).status = "connected";
               options.onConnected?.();
             }
           }
@@ -243,6 +247,10 @@ export class Whatsapp {
           if (events["messages.upsert"]) {
             const msg = events["messages.upsert"]
               .messages?.[0] as unknown as MessageReceived;
+            if (msg.message.protocolMessage) {
+              // ignore history sync messages
+              return;
+            }
             msg.sessionId = sessionId;
             msg.saveImage = (path) => saveImageHandler(msg, path);
             msg.saveVideo = (path) => saveVideoHandler(msg, path);
@@ -259,20 +267,15 @@ export class Whatsapp {
         return sock;
       }
     };
-    return startSocket();
+    try {
+      return startSocket();
+    } catch (error) {
+      console.error("!! => session error");
+    }
   }
 
   /**
-   * Start a new WhatsApp session authenticated via pairing code instead of QR scan.
-   *
-   * The flow:
-   * 1. A socket is opened to WhatsApp.
-   * 2. Once the "connecting" event fires (and the account is not yet registered),
-   *    a pairing code is requested after a short delay to let the handshake settle.
-   * 3. The code is delivered to both the global `onPairingCode` constructor callback
-   *    and the per-call `options.onPairingCode` callback — display it to the user so
-   *    they can enter it in WhatsApp → Linked Devices → Link with phone number.
-   * 4. After successful authentication the socket behaves identically to `startSession`.
+   * Start a new WhatsApp session authenticated via stable pairing code instead of QR scan.
    */
   async startSessionWithPairingCode(
     sessionId: string,
@@ -404,8 +407,8 @@ export class Whatsapp {
   async deleteSession(sessionId: string) {
     const session = await this.getSessionById(sessionId);
     try {
-      await session?.sock.logout();
-      await session?.store.clearCreds();
+      await session?.sock.logout().catch(() => {});
+      await session?.store.clearCreds().catch(() => {});
     } catch (error) {}
     session?.sock.end(undefined);
     this.sessions.delete(sessionId);
@@ -423,6 +426,9 @@ export class Whatsapp {
     }
     if (props.onDisconnected) {
       this.callback.set(CALLBACK_KEY.ON_DISCONNECTED, props.onDisconnected);
+    }
+    if (props.onPairingCode) {
+      this.callback.set(CALLBACK_KEY.ON_PAIRING_CODE, props.onPairingCode);
     }
     if (props.onMessageUpdated) {
       this.callback.set(

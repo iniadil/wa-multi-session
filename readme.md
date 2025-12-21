@@ -51,12 +51,14 @@ const whatsapp = new Whatsapp({
 
 ## Session Usage/Examples
 
-Start New Session
+Start New Session with QR Code
 
 ```ts
 // create session with ID : session1
 
-const session = await whatsapp.startSession("session1");
+const session = await whatsapp.startSession("session1", {
+  printQR: true, // print QR on terminal
+});
 // Then, scan QR on terminal
 ```
 
