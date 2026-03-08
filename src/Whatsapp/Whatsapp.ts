@@ -19,6 +19,7 @@ import {
   SendReadTypes,
   SendTypingTypes,
   StartSessionParams,
+  StartSessionWithPairingCodeOptions,
 } from "../Types";
 import { CALLBACK_KEY, Messages } from "../Defaults";
 import { WhatsappError } from "../Error";
@@ -77,7 +78,7 @@ export class Whatsapp {
     return session;
   }
   private async getSessionByIdReadyOrThrow(
-    sessionId: string
+    sessionId: string,
   ): Promise<Session> {
     const session = await this.getSessionById(sessionId);
     if (!session) throw new WhatsappError(Messages.sessionNotFound(sessionId));
@@ -97,7 +98,7 @@ export class Whatsapp {
   private getStore = async (sessionId: string): Promise<Store> => {
     const creds: AuthenticationCreds =
       stringToJsonBufferParser(
-        await this.adapter.readData(sessionId, "creds")
+        await this.adapter.readData(sessionId, "creds"),
       ) || initAuthCreds();
 
     return {
@@ -108,7 +109,7 @@ export class Whatsapp {
             const data: { [_: string]: SignalDataTypeMap[typeof type] } = {};
             for (const id of ids) {
               let value = stringToJsonBufferParser(
-                await this.adapter.readData(sessionId, `${type}-${id}`)
+                await this.adapter.readData(sessionId, `${type}-${id}`),
               );
               if (type === "app-state-sync-key" && value) {
                 value = proto.Message.AppStateSyncKeyData.fromObject(value);
@@ -126,7 +127,7 @@ export class Whatsapp {
                     sessionId,
                     `${category}-${id}`,
                     category,
-                    jsonBufferToStringParser(value)
+                    jsonBufferToStringParser(value),
                   );
                 } else {
                   await this.adapter.deleteData(sessionId, `${category}-${id}`);
@@ -141,7 +142,7 @@ export class Whatsapp {
           sessionId,
           "creds",
           "credentials",
-          jsonBufferToStringParser(creds)
+          jsonBufferToStringParser(creds),
         );
       },
       clearCreds: async () => {
@@ -155,7 +156,7 @@ export class Whatsapp {
    */
   async startSession(
     sessionId: string,
-    options: StartSessionParams = { printQR: true }
+    options: StartSessionParams = { printQR: true },
   ): Promise<WASocket> {
     if (await this.isSessionExistAndRunning(sessionId))
       throw new WhatsappError(Messages.sessionAlreadyExist(sessionId));
@@ -232,7 +233,7 @@ export class Whatsapp {
             const data: MessageUpdated = {
               sessionId: sessionId,
               messageStatus: parseMessageStatusCodeToReadable(
-                msg.update.status!
+                msg.update.status!,
               ),
               ...msg,
             };
@@ -250,6 +251,142 @@ export class Whatsapp {
             this.callback.get(CALLBACK_KEY.ON_MESSAGE_RECEIVED)?.({
               ...msg,
             });
+            options.onMessageReceived?.(msg);
+          }
+        });
+        return sock;
+      } catch (error) {
+        return sock;
+      }
+    };
+    return startSocket();
+  }
+
+  /**
+   * Start a new WhatsApp session authenticated via pairing code instead of QR scan.
+   *
+   * The flow:
+   * 1. A socket is opened to WhatsApp.
+   * 2. Once the "connecting" event fires (and the account is not yet registered),
+   *    a pairing code is requested after a short delay to let the handshake settle.
+   * 3. The code is delivered to both the global `onPairingCode` constructor callback
+   *    and the per-call `options.onPairingCode` callback — display it to the user so
+   *    they can enter it in WhatsApp → Linked Devices → Link with phone number.
+   * 4. After successful authentication the socket behaves identically to `startSession`.
+   */
+  async startSessionWithPairingCode(
+    sessionId: string,
+    options: StartSessionWithPairingCodeOptions,
+  ): Promise<WASocket> {
+    if (await this.isSessionExistAndRunning(sessionId))
+      throw new WhatsappError(Messages.sessionAlreadyExist(sessionId));
+
+    const { version } = await fetchLatestBaileysVersion();
+    const startSocket = async () => {
+      // Guard flag: ensures we only request one pairing code per socket lifetime,
+      // even if multiple "connecting" events arrive before the code is issued.
+      let isPairingCodeRequested = false;
+      const store = await this.getStore(sessionId);
+      const sock: WASocket = makeWASocket({
+        version,
+        printQRInTerminal: false, // QR is irrelevant for pairing-code flow
+        auth: store.state,
+        logger: this.P,
+        markOnlineOnConnect: false,
+        browser: Browsers.ubuntu("Chrome"),
+      });
+      this.sessions.set(sessionId, { sock, store, status: "connecting" });
+      try {
+        sock.ev.process(async (events) => {
+          if (events["connection.update"]) {
+            const update = events["connection.update"];
+            const { connection, lastDisconnect } = update;
+
+            // Request the pairing code exactly once, as soon as the socket starts
+            // connecting and the account credentials are not yet registered.
+            // A 2-second delay is applied before the request to ensure the
+            // Baileys handshake has had time to exchange keys with WhatsApp servers.
+            if (
+              !sock.authState.creds.registered &&
+              (connection === "connecting" || !!update.qr) &&
+              !isPairingCodeRequested
+            ) {
+              isPairingCodeRequested = true;
+              await createDelay(2000);
+              try {
+                const code = await sock.requestPairingCode(options.phoneNumber);
+                // Notify both the global (constructor-level) callback and the per-call callback.
+                this.callback.get(CALLBACK_KEY.ON_PAIRING_CODE)?.(
+                  sessionId,
+                  code,
+                );
+                options.onPairingCode?.(code);
+              } catch (error) {
+                console.log("Error Requesting Pairing Code", error);
+                // Reset the flag so the next connection event can retry the request.
+                isPairingCodeRequested = false;
+              }
+            }
+
+            if (connection == "connecting") {
+              this.callback.get(CALLBACK_KEY.ON_CONNECTING)?.(sessionId);
+              options.onConnecting?.();
+              this.sessions.get(sessionId)!.status = "connecting";
+            }
+            if (connection === "close") {
+              const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+              let retryAttempt = this.retryCount.get(sessionId) ?? 0;
+              let shouldRetry;
+              // Retry on any disconnection except an explicit logout, up to 10 attempts.
+              if (code !== DisconnectReason.loggedOut && retryAttempt < 10) {
+                shouldRetry = true;
+              }
+              if (shouldRetry) {
+                retryAttempt++;
+                this.retryCount.set(sessionId, retryAttempt);
+                startSocket();
+              } else {
+                // Max retries exceeded or user logged out — clean up the session.
+                this.sessions.get(sessionId)!.status = "disconnected";
+                this.retryCount.delete(sessionId);
+                this.deleteSession(sessionId);
+                this.callback.get(CALLBACK_KEY.ON_DISCONNECTED)?.(sessionId);
+                options.onDisconnected?.();
+              }
+            }
+            if (connection == "open") {
+              this.retryCount.delete(sessionId);
+              this.callback.get(CALLBACK_KEY.ON_CONNECTED)?.(sessionId);
+              this.sessions.get(sessionId)!.status = "connected";
+              options.onConnected?.();
+            }
+          }
+          if (events["creds.update"]) {
+            // Persist updated credentials (e.g. after pairing or key rotation).
+            await store.saveCreds();
+          }
+          if (events["messages.update"]) {
+            const msg = events["messages.update"][0];
+            const data: MessageUpdated = {
+              sessionId,
+              messageStatus: parseMessageStatusCodeToReadable(
+                msg.update.status!,
+              ),
+              ...msg,
+            };
+            this.callback.get(CALLBACK_KEY.ON_MESSAGE_UPDATED)?.(data);
+            options.onMessageUpdated?.(data);
+          }
+          if (events["messages.upsert"]) {
+            const msg = events["messages.upsert"]
+              .messages?.[0] as unknown as MessageReceived;
+            msg.sessionId = sessionId;
+            // Attach convenience save helpers so consumers can persist media without extra imports.
+            msg.saveImage = (path) => saveImageHandler(msg, path);
+            msg.saveVideo = (path) => saveVideoHandler(msg, path);
+            msg.saveDocument = (path) => saveDocumentHandler(msg, path);
+            msg.saveAudio = (path) => saveAudioHandler(msg, path);
+            this.callback.get(CALLBACK_KEY.ON_MESSAGE_RECEIVED)?.({ ...msg });
             options.onMessageReceived?.(msg);
           }
         });
@@ -290,17 +427,21 @@ export class Whatsapp {
     if (props.onMessageUpdated) {
       this.callback.set(
         CALLBACK_KEY.ON_MESSAGE_UPDATED,
-        props.onMessageUpdated
+        props.onMessageUpdated,
       );
     }
     if (props.onMessageReceived) {
       this.callback.set(
         CALLBACK_KEY.ON_MESSAGE_RECEIVED,
-        props.onMessageReceived
+        props.onMessageReceived,
       );
     }
     if (props.onQRUpdated) {
       this.callback.set(CALLBACK_KEY.ON_QR, props.onQRUpdated);
+    }
+    if (props.onPairingCode) {
+      // Global pairing-code listener — receives (sessionId, code) for every session started via startSessionWithPairingCode.
+      this.callback.set(CALLBACK_KEY.ON_PAIRING_CODE, props.onPairingCode);
     }
   }
 
@@ -355,7 +496,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -379,7 +520,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -403,7 +544,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -438,7 +579,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -448,7 +589,7 @@ export class Whatsapp {
   sendAudio = async (
     props: Omit<SendMediaTypes, "text"> & {
       asVoiceNote?: boolean;
-    }
+    },
   ) => {
     const session = await this.getSessionByIdReadyOrThrow(props.sessionId);
     const to = phoneToJid({ to: props.to, isGroup: props.isGroup });
@@ -470,7 +611,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -497,7 +638,7 @@ export class Whatsapp {
       },
       {
         quoted: props.answering,
-      }
+      },
     );
   };
 
@@ -573,7 +714,7 @@ export class Whatsapp {
       });
       if (!props.isGroup) {
         const one = Boolean(
-          (await session?.sock.onWhatsApp(receiver))?.[0]?.exists
+          (await session?.sock.onWhatsApp(receiver))?.[0]?.exists,
         );
         return one;
       } else {

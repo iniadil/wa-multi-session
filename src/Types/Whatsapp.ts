@@ -16,4 +16,6 @@ export type WhatsappConstructorProps = {
   onMessageUpdated?: (data: MessageUpdated) => any;
   onMessageReceived?: (msg: MessageReceived) => any;
   onQRUpdated?: (qr: string) => any;
+  /** Fired when a pairing code is generated for any session. Receives the sessionId and the 8-character code to display to the user. */
+  onPairingCode?: (sessionId: string, code: string) => any;
 };
