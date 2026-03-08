@@ -194,7 +194,7 @@ export class Whatsapp {
                   (error, qrcode) => {
                     console.log(sessionId + ":");
                     console.log(qrcode);
-                  }
+                  },
                 );
               }
             }
@@ -280,7 +280,7 @@ export class Whatsapp {
 
   /**
    * Start a new WhatsApp session authenticated via stable pairing code instead of QR scan.
-   */
+   * */
   async startSessionWithPairingCode(
     sessionId: string,
     options: StartSessionWithPairingCodeOptions,
